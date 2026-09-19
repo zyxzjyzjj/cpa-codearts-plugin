@@ -772,42 +772,131 @@ func runCheckinTask(task ScheduleTask) error {
 	}
 
 	// The claim is authenticated exactly like every other upstream call.
-	cred, errCred := firstCredential()
-	if errCred != nil {
-		return fmt.Errorf("no credential available to sign the check-in request: %w", errCred)
+	accounts, errSelect := checkinCredentials(task)
+	if errSelect != nil {
+		return errSelect
 	}
+
+	claimed, already, failures := 0, 0, make([]string, 0, len(accounts))
+	for _, account := range accounts {
+		outcome, errClaim := claimForCredential(task, cfg, method, target, headers, body, account.credential)
+		if errClaim != nil {
+			failures = append(failures, account.label+": "+errClaim.Error())
+			logWarn("check-in failed for account", map[string]any{
+				"task": task.ID, "account": account.label, "error": errClaim.Error(),
+			})
+			continue
+		}
+		if outcome == "already" {
+			already++
+		} else {
+			claimed++
+		}
+	}
+
+	switch {
+	case claimed+already == 0:
+		recordTaskResult(task.ID, fmt.Sprintf("0 of %d account(s) claimed", len(accounts)))
+		return fmt.Errorf("check-in failed for every account: %s", strings.Join(failures, "; "))
+	case len(failures) > 0:
+		// Some accounts claimed and some did not. Report both: failing the task
+		// outright would hide the claims that did land, and staying silent would
+		// hide the account that needs attention.
+		recordTaskResult(task.ID, fmt.Sprintf("%d claimed, %d already, %d failed: %s",
+			claimed, already, len(failures), strings.Join(failures, "; ")))
+	default:
+		recordTaskResult(task.ID, fmt.Sprintf("%d claimed, %d already (%d account(s))", claimed, already, len(accounts)))
+	}
+	return nil
+}
+
+// checkinAccount pairs a credential with the label used in logs and task results.
+type checkinAccount struct {
+	label      string
+	credential *credential
+}
+
+// checkinCredentials chooses which accounts the claim runs for. Without an
+// explicit choice it keeps the historical one-credential behaviour: a claim
+// endpoint is not necessarily per account, and repeating an unknown request for
+// every stored credential is exactly the traffic pattern upstream throttles.
+func checkinCredentials(task ScheduleTask) ([]checkinAccount, error) {
+	files, errList := hostAuthList()
+	if errList != nil {
+		// Phrased around the credential on purpose: an unreadable inventory means
+		// the claim cannot be attributed to any account, which is what an operator
+		// needs to hear.
+		return nil, fmt.Errorf("no usable %s credential could be resolved: %w", providerID, errList)
+	}
+	wanted := strings.TrimSpace(task.CheckinAuthIndex)
+	selected := make([]checkinAccount, 0, len(files))
+	for _, file := range files {
+		if normalizeProvider(file.Provider) != providerID && normalizeProvider(file.Type) != providerID {
+			continue
+		}
+		if wanted != "" && !strings.EqualFold(file.AuthIndex, wanted) &&
+			!strings.EqualFold(file.Name, wanted) && !strings.EqualFold(file.Label, wanted) {
+			continue
+		}
+		storage, errGet := hostAuthGet(file.AuthIndex)
+		if errGet != nil {
+			continue
+		}
+		cred, errCred := credentialFromStorage(storage)
+		if errCred != nil || !cred.valid() {
+			continue
+		}
+		selected = append(selected, checkinAccount{
+			label:      firstNonEmptyString(file.Label, file.Name, file.AuthIndex),
+			credential: cred,
+		})
+	}
+	if len(selected) == 0 {
+		if wanted != "" {
+			return nil, fmt.Errorf("no usable %s credential matches checkin_auth_index %q", providerID, wanted)
+		}
+		return nil, fmt.Errorf("no usable %s credential is configured", providerID)
+	}
+	if wanted == "" && !task.CheckinAllAccounts {
+		return selected[:1], nil
+	}
+	return selected, nil
+}
+
+// claimForCredential performs one claim with one credential and judges the result
+// from the configured markers rather than the status code alone. It returns the
+// outcome label: "claimed" or "already".
+func claimForCredential(task ScheduleTask, cfg *Config, method, target string, headers map[string]string, body []byte, cred *credential) (string, error) {
 	signed, errSign := signRequest(method, target, headers, body, cred, cfg.SignHost)
 	if errSign != nil {
-		return fmt.Errorf("sign check-in request: %w", errSign)
+		return "", fmt.Errorf("sign check-in request: %w", errSign)
 	}
 
 	response, errDo := hostHTTPDo(method, target, signed, body)
 	if errDo != nil {
-		return fmt.Errorf("check-in request failed: %w", errDo)
+		return "", fmt.Errorf("check-in request failed: %w", errDo)
 	}
 
 	text := string(response.Body)
 	switch {
 	case response.StatusCode < 200 || response.StatusCode >= 300:
-		return fmt.Errorf("check-in returned HTTP %d: %s", response.StatusCode, truncate(text, 300))
+		return "", fmt.Errorf("returned HTTP %d: %s", response.StatusCode, truncate(text, 300))
 	case task.CheckinAlreadyMarker != "" && strings.Contains(text, task.CheckinAlreadyMarker):
 		// Already claimed today: a successful, idempotent outcome.
-		recordTaskResult(task.ID, "already claimed today")
 		logInfo("check-in already claimed", map[string]any{"task": task.ID})
-		return nil
+		return "already", nil
 	case task.CheckinSuccessMarker != "" && !strings.Contains(text, task.CheckinSuccessMarker):
 		// A 200 without the success marker means the claim did not happen, for
 		// example a rejected or expired request. Reporting success here would
 		// hide a real problem.
-		return fmt.Errorf("check-in returned HTTP %d but the response did not contain the success marker %q: %s",
+		return "", fmt.Errorf("returned HTTP %d but the response did not contain the success marker %q: %s",
 			response.StatusCode, task.CheckinSuccessMarker, truncate(text, 300))
 	default:
-		recordTaskResult(task.ID, fmt.Sprintf("HTTP %d, %d bytes", response.StatusCode, len(response.Body)))
 		logInfo("check-in completed", map[string]any{
 			"task":   task.ID,
 			"status": response.StatusCode,
 		})
-		return nil
+		return "claimed", nil
 	}
 }
 

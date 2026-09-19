@@ -15,6 +15,10 @@ type Config struct {
 	// BaseURL is the CodeArts Doer regional API endpoint. Both the native chat
 	// API and the OpenAI-compatible agent API are served from this host.
 	BaseURL string `yaml:"base_url" json:"base_url"`
+	// BenefitBaseURL is the open gateway that serves the 限时福利 (free tier)
+	// catalogue and its daily claim. Its models are absent from every agent
+	// catalogue and need the maas_type: benefit header on chat requests.
+	BenefitBaseURL string `yaml:"benefit_base_url" json:"benefit_base_url"`
 	// WebLoginBase is the web console used to start the browser login flow.
 	WebLoginBase string `yaml:"web_login_base" json:"web_login_base"`
 	// OAuthTokenURL and OAuthIdentityURL are the Huawei STS endpoints used by
@@ -162,6 +166,13 @@ type ScheduleTask struct {
 	// CheckinAlreadyMarker is a substring indicating the benefit was already
 	// claimed today. Matching it counts as success rather than a failure.
 	CheckinAlreadyMarker string `yaml:"checkin_already_marker" json:"checkin_already_marker"`
+	// CheckinAllAccounts runs the claim once per stored credential. The benefit
+	// allowance is granted per Huawei Cloud account, so a deployment with several
+	// accounts only collects one account's worth without this.
+	CheckinAllAccounts bool `yaml:"checkin_all_accounts" json:"checkin_all_accounts"`
+	// CheckinAuthIndex restricts the claim to one credential, matched against the
+	// auth index, file name or label. Empty means "not restricted".
+	CheckinAuthIndex string `yaml:"checkin_auth_index" json:"checkin_auth_index"`
 }
 
 // isEnabled reports whether the task is on. An omitted flag means enabled, so a
@@ -201,6 +212,10 @@ type ModelConfig struct {
 	ContextLength   int64  `yaml:"context_length" json:"context_length"`
 	MaxOutputTokens int64  `yaml:"max_output_tokens" json:"max_output_tokens"`
 	SupportsImages  bool   `yaml:"supports_images" json:"supports_images"`
+	// Benefit marks a 限时福利 model: it is absent from the agent catalogue and
+	// the chat endpoint answers "The model is not registered" unless the request
+	// carries a signed maas_type: benefit header.
+	Benefit bool `yaml:"benefit" json:"benefit"`
 }
 
 // defaultConfig returns the built-in defaults. The upstream model list is
@@ -209,6 +224,7 @@ type ModelConfig struct {
 func defaultConfig() *Config {
 	return &Config{
 		BaseURL:               "https://snap-access.cn-north-4.myhuaweicloud.com",
+		BenefitBaseURL:        "https://opengw.developer.huaweicloud.com",
 		WebLoginBase:          "https://codearts.huaweicloud.com",
 		OAuthTokenURL:         codeArtsOAuthTokenURL,
 		OAuthIdentityURL:      codeArtsOAuthIdentityURL,
@@ -217,7 +233,7 @@ func defaultConfig() *Config {
 		PluginVersion:         "26.9.101",
 		Language:              "en-us",
 		AgentID:               "Pangu_Doer_in_CodeArts",
-		DefaultModelID:        "PanguDev_COM_QC2",
+		DefaultModelID:        "GLM-5.2",
 		RequestTimeoutSeconds: 600,
 		LoginTimeoutSeconds:   300,
 		Heartbeat:             true,
@@ -229,12 +245,12 @@ func defaultConfig() *Config {
 func defaultModels() []ModelConfig {
 	return []ModelConfig{
 		{
-			ID:              "PanguDev_COM_QC2",
-			Name:            "PanguDev_COM_QC2",
-			DisplayName:     "Pangu Dev (CodeArts)",
+			ID:              "GLM-5.2",
+			Name:            "GLM-5.2",
+			DisplayName:     "GLM-5.2 (CodeArts)",
 			Description:     "Huawei CodeArts Doer chat model served through the CodeArts Doer gateway.",
-			ContextLength:   128000,
-			MaxOutputTokens: 8192,
+			ContextLength:   202752,
+			MaxOutputTokens: 131072,
 		},
 	}
 }
@@ -437,6 +453,29 @@ func (c *Config) upstreamModel(model string) string {
 		return model
 	}
 	return c.DefaultModelID
+}
+
+// isBenefitModel reports whether the upstream model ID routes through 限时福利.
+// Configured models answer from their `benefit` flag; discovered ones from the
+// catalogue they arrived through. Matched case-insensitively against both id and
+// name, mirroring how the official client routes these models by name.
+func (c *Config) isBenefitModel(upstream string) bool {
+	target := strings.ToLower(strings.TrimSpace(upstream))
+	if target == "" {
+		return false
+	}
+	if c != nil {
+		for _, model := range c.Models {
+			if !model.Benefit {
+				continue
+			}
+			if strings.ToLower(strings.TrimSpace(model.ID)) == target ||
+				strings.ToLower(strings.TrimSpace(model.Name)) == target {
+				return true
+			}
+		}
+	}
+	return isKnownBenefitModel(target)
 }
 
 func (c *Config) requestTimeout() time.Duration {

@@ -2,6 +2,9 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
+	"net/http"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -184,4 +187,141 @@ func nowTime() time.Time { return time.Now() }
 // pluginapiManagementRequest builds a ManagementRequest with a JSON body.
 func pluginapiManagementRequest(body string) pluginapi.ManagementRequest {
 	return pluginapi.ManagementRequest{Method: "POST", Path: "/v0/management/codearts-provider/checkin", Body: []byte(body)}
+}
+
+// checkinAccessKeys returns the Access= field of each recorded signature.
+func checkinAccessKeys(t *testing.T, bodies []string) []string {
+	t.Helper()
+	var keys []string
+	for _, raw := range bodies {
+		match := regexp.MustCompile(`Access=([^,]+)`).FindStringSubmatch(raw)
+		if match == nil {
+			t.Fatalf("no access key in signature header: %q", raw)
+		}
+		keys = append(keys, match[1])
+	}
+	return keys
+}
+
+// checkinStub installs a host that holds two CodeArts credentials and answers the
+// claim endpoint. claimFor decides the response per access key, and the returned
+// slice records which key signed each claim in call order.
+func checkinStub(t *testing.T, claimFor func(accessKey string) hostHTTPResponse) (func(), *[]string) {
+	t.Helper()
+	storages := map[string]string{
+		"idx-a": `{"codearts_provider_credential":{"access_key_id":"ak-a","secret_access_key":"sk-a"}}`,
+		"idx-b": `{"codearts_provider_credential":{"access_key_id":"ak-b","secret_access_key":"sk-b"}}`,
+	}
+	keys := &[]string{}
+	restore := setHostCall(func(method string, request any) (json.RawMessage, error) {
+		switch method {
+		case "host.auth.list":
+			return json.Marshal(map[string]any{"files": []pluginapi.HostAuthFileEntry{
+				{AuthIndex: "idx-a", Name: "a.json", Provider: providerID, Label: "alpha"},
+				{AuthIndex: "idx-b", Name: "b.json", Provider: providerID, Label: "beta"},
+			}})
+		case "host.auth.get":
+			index := request.(map[string]any)["auth_index"].(string)
+			return json.Marshal(map[string]any{"json": json.RawMessage(storages[index])})
+		case "host.http.do":
+			headers := request.(map[string]any)["headers"].(map[string][]string)
+			match := regexp.MustCompile(`Access=([^,]+)`).FindStringSubmatch(headers["Authorization"][0])
+			if match == nil {
+				t.Fatalf("claim request carried no access key: %q", headers["Authorization"][0])
+			}
+			*keys = append(*keys, match[1])
+			return json.Marshal(claimFor(match[1]))
+		default:
+			return nil, fmt.Errorf("unexpected callback %s", method)
+		}
+	})
+	return restore, keys
+}
+
+func claimSucceeded(string) hostHTTPResponse {
+	return hostHTTPResponse{StatusCode: http.StatusOK, Body: []byte(`{"error_msg":"success"}`)}
+}
+
+func TestCheckinClaimsEveryAccountWhenAsked(t *testing.T) {
+	restore, keys := checkinStub(t, claimSucceeded)
+	defer restore()
+
+	task := ScheduleTask{ID: "claim-all", Type: TaskCheckin, CheckinURL: "https://benefit.test/claim",
+		CheckinMethod: "POST", CheckinSuccessMarker: `"error_msg":"success"`, CheckinAllAccounts: true}
+	if err := runCheckinTask(task); err != nil {
+		t.Fatal(err)
+	}
+	if len(*keys) != 2 || (*keys)[0] != "ak-a" || (*keys)[1] != "ak-b" {
+		t.Fatalf("claims signed by %v, want one per stored credential", *keys)
+	}
+	if result := scheduler.snapshot()["claim-all"].LastResult; !strings.Contains(result, "2 claimed") {
+		t.Fatalf("task result lost the per-account summary: %q", result)
+	}
+}
+
+func TestCheckinDefaultsToSingleCredential(t *testing.T) {
+	restore, keys := checkinStub(t, claimSucceeded)
+	defer restore()
+
+	task := ScheduleTask{ID: "claim-one", Type: TaskCheckin, CheckinURL: "https://benefit.test/claim", CheckinMethod: "POST"}
+	if err := runCheckinTask(task); err != nil {
+		t.Fatal(err)
+	}
+	if len(*keys) != 1 {
+		t.Fatalf("a check-in without checkin_all_accounts claimed %d times, want 1", len(*keys))
+	}
+}
+
+func TestCheckinTargetsOneAccount(t *testing.T) {
+	restore, keys := checkinStub(t, claimSucceeded)
+	defer restore()
+
+	// A label is accepted as well as an auth index, because the panel shows labels.
+	task := ScheduleTask{ID: "claim-pick", Type: TaskCheckin, CheckinURL: "https://benefit.test/claim",
+		CheckinMethod: "POST", CheckinAuthIndex: "beta"}
+	if err := runCheckinTask(task); err != nil {
+		t.Fatal(err)
+	}
+	if len(*keys) != 1 || (*keys)[0] != "ak-b" {
+		t.Fatalf("claims signed by %v, want only ak-b", *keys)
+	}
+}
+
+func TestCheckinReportsPartialFailureWithoutHidingSuccess(t *testing.T) {
+	restore, keys := checkinStub(t, func(accessKey string) hostHTTPResponse {
+		if accessKey == "ak-b" {
+			// A 200 without the success marker is a rejected claim, not a silent win.
+			return hostHTTPResponse{StatusCode: http.StatusOK, Body: []byte(`{"error_msg":"not eligible"}`)}
+		}
+		return claimSucceeded(accessKey)
+	})
+	defer restore()
+
+	task := ScheduleTask{ID: "claim-partial", Type: TaskCheckin, CheckinURL: "https://benefit.test/claim",
+		CheckinMethod: "POST", CheckinSuccessMarker: `"error_msg":"success"`, CheckinAllAccounts: true}
+	if err := runCheckinTask(task); err != nil {
+		t.Fatalf("a partial success must not fail the whole task: %v", err)
+	}
+	if len(*keys) != 2 {
+		t.Fatalf("the second account was skipped after the first answered: %v", *keys)
+	}
+	result := scheduler.snapshot()["claim-partial"].LastResult
+	if !strings.Contains(result, "1 claimed") || !strings.Contains(result, "1 failed") || !strings.Contains(result, "beta") {
+		t.Fatalf("partial outcome not reported per account: %q", result)
+	}
+}
+
+func TestCheckinUnknownAuthIndexIsRefused(t *testing.T) {
+	restore, keys := checkinStub(t, claimSucceeded)
+	defer restore()
+
+	task := ScheduleTask{ID: "claim-missing", Type: TaskCheckin, CheckinURL: "https://benefit.test/claim",
+		CheckinMethod: "POST", CheckinAuthIndex: "does-not-exist"}
+	err := runCheckinTask(task)
+	if err == nil || !strings.Contains(err.Error(), "checkin_auth_index") {
+		t.Fatalf("want a refusal naming checkin_auth_index, got %v", err)
+	}
+	if len(*keys) != 0 {
+		t.Fatalf("an unmatched auth index still claimed %d times", len(*keys))
+	}
 }

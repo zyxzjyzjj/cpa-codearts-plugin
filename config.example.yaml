@@ -30,9 +30,18 @@ plugins:
 
       # CodeArts Doer regional API gateway. Both the native chat API and the
       # OpenAI-compatible agent API are served from this host.
-      # Regions: cn-north-4 (Beijing), cn-east-3 (Shanghai), cn-south-1 (Guangzhou),
-      #          ap-southeast-1 (Singapore), ...
+      # The 26.9.x client ships only two regions: cn-north-4 (Beijing) and
+      # ap-southeast-1 (Singapore). The gateway host must match the region that
+      # issued the login token, otherwise every call comes back as an
+      # unregistered model.
       base_url: "https://snap-access.cn-north-4.myhuaweicloud.com"
+
+      # 限时福利 (free tier) gateway. It serves the daily-claimable catalogue and
+      # its own model list; those models are absent from every agent catalogue and
+      # are reached on chat by signing an extra `maas_type: benefit` header, which
+      # the plugin adds automatically for anything this list returns.
+      # Set it to an empty string to stop advertising benefit models.
+      benefit_base_url: "https://opengw.developer.huaweicloud.com"
 
       # Upstream protocol.
       #   agent  - OpenAI-compatible POST /api/v2/chat/completions
@@ -70,30 +79,46 @@ plugins:
       agent_id: "Pangu_Doer_in_CodeArts"
 
       # Upstream model_id used when the requested model has no explicit mapping.
-      default_model_id: "PanguDev_COM_QC2"
+      default_model_id: "GLM-5.2"
 
       # Client-facing ID -> upstream model_id. Add an entry per model you want to
       # expose under a friendlier alias.
       model_map:
-        "pangu-dev": "PanguDev_COM_QC2"
+        "glm": "GLM-5.2"
 
-      # Models advertised to CLIProxyAPI. The upstream catalogue is tenant
-      # specific, so adjust this list to the models your account can reach.
+      # Models advertised to CLIProxyAPI when discovery is off, and the fallback
+      # list when it fails. Use the IDs the account actually owns: an ID the
+      # gateway does not recognise is answered
+      # `InferHub.002002009.404 The model is not registered`.
       models:
-        - id: "PanguDev_COM_QC2"
-          name: "PanguDev_COM_QC2"
-          display_name: "Pangu Dev (CodeArts)"
-          description: "Huawei CodeArts Doer chat model."
-          context_length: 128000
-          max_output_tokens: 8192
+        - id: "GLM-5.2"
+          name: "GLM-5.2"
+          display_name: "GLM-5.2 (CodeArts)"
+          description: "CodeArts Doer chat model."
+          context_length: 202752
+          max_output_tokens: 131072
+        # `benefit: true` marks a 限时福利 model, so its chat requests carry the
+        # signed maas_type: benefit header. Discovery tags these automatically;
+        # the flag is only needed when listing them by hand.
+        - id: "deepseek-v4-pro-0813"
+          name: "deepseek-v4-pro-0813"
+          display_name: "DeepSeek-V4-Pro (CodeArts 限时福利)"
+          context_length: 1048576
+          max_output_tokens: 393216
+          benefit: true
 
-      # Ask the upstream Agent Center for this account's model list on
-      # model.for_auth instead of advertising the static list above. Results are
-      # cached per account for 5 minutes; any failure falls back to `models`.
+      # Ask the upstream for this account's model list on model.for_auth instead
+      # of advertising the static list above. Three catalogues are merged, in
+      # order: the built-in list (`GET /v1/model/builtin`, the endpoint the IDE's
+      # own model picker reads), the 限时福利 list from `benefit_base_url`, and —
+      # only when both come back empty — the agent-centre detail query below.
+      # Results are cached per account for 5 minutes; any total failure falls back
+      # to `models`.
       discover_models: true
 
-      # Agent IDs queried for discovery. Empty uses the extension's own Act and
-      # Plan agents. Set these when your tenant uses different agents.
+      # Agent IDs used by the agent-centre fallback. Empty uses the extension's
+      # own Act and Plan agents. Set these when your tenant attaches models to
+      # different agents; the built-in catalogue normally makes this unnecessary.
       model_agent_ids: []
 
       # ---------------------------------------------------------------------
@@ -174,18 +199,28 @@ plugins:
             type: "checkin"
             cron: "5 0 * * *"                          # 00:05 daily
             checkin_method: "POST"
-            # Absolute, or a path resolved against base_url.
-            checkin_url: "/v1/activity/benefit/daily/claim"
-            checkin_body: '{"activityCode":"daily_sign_in"}'
+            # Absolute, or a path resolved against base_url. The 限时福利 claim
+            # lives on the open gateway and takes an empty body; it is idempotent,
+            # so running it twice a day is harmless.
+            checkin_url: "https://opengw.developer.huaweicloud.com/api/v1/benefit/claim"
+            checkin_body: ""
             checkin_headers: {}
               # x-snap-traceid: "..."   # only if the page sends one
             # Text that appears only on a real claim. With this set, a bare HTTP
             # 200 that lacks the marker is reported as a failure rather than a
             # silent success.
-            checkin_success_marker: ""
+            checkin_success_marker: '"error_msg":"success"'
             # Text meaning "already claimed today". Matching it counts as
             # success, so a twice-a-day schedule does not look like a failure.
             checkin_already_marker: ""
+            # The allowance is granted per Huawei Cloud account, so a deployment
+            # with several credentials has to claim for each of them. Off by
+            # default: an unknown claim URL is not necessarily per-account, and
+            # repeating it for every credential is the pattern upstream throttles.
+            checkin_all_accounts: true
+            # Or pin one account by auth index, file name or label. Empty means
+            # "not restricted".
+            checkin_auth_index: ""
             enabled: false
 
           # Escape hatch: schedule any CodeArts gateway endpoint. `path` is

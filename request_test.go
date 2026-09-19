@@ -12,9 +12,10 @@ import (
 func TestBuildAgentBodyPreservesClientRequest(t *testing.T) {
 	cfg := defaultConfig()
 	cfg.APIMode = "agent"
-	cfg.ModelMap = map[string]string{"alias-model": "PanguDev_COM_QC2"}
+	cfg.ModelMap = map[string]string{"alias-model": "upstream-model"}
 
 	req := executorRequest{}
+	req.Model = "alias-model"
 	req.Payload = []byte(`{
 		"model": "alias-model",
 		"messages": [{"role":"user","content":"hi"}],
@@ -29,7 +30,7 @@ func TestBuildAgentBodyPreservesClientRequest(t *testing.T) {
 	if errUnmarshal := json.Unmarshal(body, &decoded); errUnmarshal != nil {
 		t.Fatalf("body is not valid JSON: %v", errUnmarshal)
 	}
-	if decoded["model"] != "PanguDev_COM_QC2" {
+	if decoded["model"] != "upstream-model" {
 		t.Fatalf("model = %v, want the mapped upstream model", decoded["model"])
 	}
 	if decoded["stream"] != true {

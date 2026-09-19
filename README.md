@@ -179,7 +179,7 @@ Responses clients (`/v1/responses`), with tool calls and usage preserved.
          priority: 100
          base_url: "https://snap-access.cn-north-4.myhuaweicloud.com"
          api_mode: "agent"
-         default_model_id: "PanguDev_COM_QC2"
+         default_model_id: "GLM-5.2"
    ```
 
    The plugin binary must be built with CGO; a non-CGO CLIProxyAPI build reports
@@ -277,14 +277,14 @@ Responses clients (`/v1/responses`), with tool calls and usage preserved.
    # 2. Chat Completions (streaming)
    curl -sN http://localhost:8317/v1/chat/completions \
      -H "Authorization: Bearer $CLIENT_KEY" -H "Content-Type: application/json" \
-     -d '{"model":"PanguDev_COM_QC2","stream":true,"stream_options":{"include_usage":true},
+     -d '{"model":"GLM-5.2","stream":true,"stream_options":{"include_usage":true},
           "messages":[{"role":"user","content":"hi"}]}'
    #    -> OpenAI SSE chunks, one "data: [DONE]", final chunk carries "usage"
 
    # 3. Anthropic Messages (streaming) — what Claude Code sends
    curl -sN http://localhost:8317/v1/messages \
      -H "Authorization: Bearer $CLIENT_KEY" -H "Content-Type: application/json" \
-     -d '{"model":"PanguDev_COM_QC2","max_tokens":64,"stream":true,
+     -d '{"model":"GLM-5.2","max_tokens":64,"stream":true,
           "messages":[{"role":"user","content":"hi"}]}'
    #    -> event: message_start / content_block_start / content_block_delta(text_delta)
    #       / content_block_stop / message_delta(stop_reason, usage) / message_stop
@@ -292,62 +292,64 @@ Responses clients (`/v1/responses`), with tool calls and usage preserved.
    # 4. OpenAI Responses (streaming)
    curl -sN http://localhost:8317/v1/responses \
      -H "Authorization: Bearer $CLIENT_KEY" -H "Content-Type: application/json" \
-     -d '{"model":"PanguDev_COM_QC2","input":"hi","stream":true}'
+     -d '{"model":"GLM-5.2","input":"hi","stream":true}'
    ```
 
    A CodeArts account also answers `POST /v1/messages` with
    `tools`/`input_schema` as Anthropic `tool_use` blocks, and
    `/v1/messages/count_tokens` with an `input_tokens` estimate.
 
-## Daily check-in (签到 / 积分领取)
+## Daily benefit claim (限时福利 / 每日领取)
 
-The daily benefit claim exists, but **it is not an API the extension calls**.
-This matters for how you automate it, so here is exactly what was established:
+The free-tier allowance is claimed through an API, and the plugin uses it. Earlier
+revisions of this README claimed the opposite — that the claim was only a
+server-rendered web page (the "Wish Wall" / 心愿墙) with no published request
+shape, so the plugin refused to guess it. That was wrong for the 26.9.x builds:
+the endpoints live on the open gateway rather than under `snap-access`, which is
+why grepping the chat path never surfaced them.
 
-- The claim UI (「每日签到领取1000积分」,「学生认证领取4000积分」,「新用户注册送4000积分」,
-  「今日已领」) is a **server-hosted web page** — the "Wish Wall"
-  (`codemate.wishWall` / 心愿墙). The extension merely opens it:
-  `openUrlInEditor` → `_workbench.openWebview(title, wishWallUrl, …)`, with the
-  URL taken from a server-provided domain config (`wishWallUrl`).
-- Those strings appear **nowhere** in the VSIX. A full scan of all 583 files
-  across UTF-8 / GB18030 / UTF-16LE / UTF-16BE / Big5 returned zero hits for
-  `今日已领`, `每日签到领`, `学生认证领`, `新用户注册送`, `立即认证`, `1000积分`,
-  `4000积分`. The panel is rendered by the server, not by the extension.
-- Consequently the extension contains **no claim endpoint, no claim request
-  shape, and no claim code path**. The three endpoints that look adjacent are
-  unrelated: `/snap-manager/v1/statistics/plugin` is a read-only usage report,
-  `/user/project` checks tenant provisioning, `/projects/sync` provisions one.
-- The commercial build does not even define `wishWallUrl` (only the internal
-  build assigns it), so on the public build the entry may not appear at all.
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `GET` | `{benefit_base_url}/api/v1/gateway/config` | The 限时福利 catalogue plus its `base_url`. Answered with `error_code: "0000"`; entries carry `model_id`, `context_window`, `max_tokens`. |
+| `POST` | `{benefit_base_url}/api/v1/benefit/claim` | Claim today's allowance. Empty body, and idempotent: a second claim still answers `0000`. |
+| `GET` | `{benefit_base_url}/api/v1/user/tokens/balance` | `daily_token_limit`, `daily_tokens_used`, `total_balance`. |
 
-Because the request shape is not published, this plugin **does not guess it**.
-Instead the `checkin` task type schedules a request you capture once:
+All three are signed with the same `SDK-HMAC-SHA256` scheme and the same
+credential as every other upstream call, so the temporary AK/SK that the browser
+authorization stores is enough — a separate IAM key is not required.
+
+Claiming is what makes the benefit models answer at all: asking the chat endpoint
+for one that has not been claimed returns `InferHub.002002009.404 The model is not
+registered`, the same message an unknown model produces. Huawei documents the
+allowance as available to all users at 1,000 万 tokens/day
+([活动说明](https://support.huaweicloud.com/offers-codeartsagent/codeartsagent_offers_0001.html)),
+so schedule the claim daily rather than assuming it happened:
 
 ```yaml
 schedule:
   enabled: true
   tasks:
-    - id: "daily-checkin"
+    - id: "daily-benefit"
       type: "checkin"
       cron: "5 0 * * *"                       # 00:05 daily
       checkin_method: "POST"
-      checkin_url: "/v1/activity/benefit/daily/claim"   # captured from the page
-      checkin_body: '{"activityCode":"daily_sign_in"}'
-      checkin_headers:
-        x-snap-traceid: "..."                 # only if the page sends one
-      # Text that appears only on a real claim, so a no-op is not called success.
-      checkin_success_marker: '"code":"0"'
+      checkin_url: "https://opengw.developer.huaweicloud.com/api/v1/benefit/claim"
+      checkin_success_marker: '"error_msg":"success"'
       # Text meaning "already claimed today" — treated as success, not failure.
       checkin_already_marker: "已领取"
 ```
 
 `checkin_url` may be absolute or a path resolved against `base_url`. The request
-is signed the same way as every other upstream call. Because the upstream
+is signed the same way as every other upstream call. **With more than one stored
+credential, set `checkin_all_accounts: true`**: the allowance belongs to each
+account separately, and by default the claim runs once, for whichever credential
+resolves first. Partial results are reported per account (`2 claimed, 0 already`,
+or `1 claimed, 1 failed: <account>: …`) rather than collapsing to one status. Because the upstream
 contract is unpublished, the outcome is judged by the markers above rather than
 by HTTP status alone: a bare `200` without the success marker is reported as a
 failure, so a silently rejected claim never looks like a success.
 
-### How to capture the claim request
+### Other captured activities
 
 1. Open the daily benefit page (Wish Wall) in a browser and sign in.
 2. DevTools → Network, clear it, then click the daily claim button.
@@ -528,28 +530,40 @@ leaves the other two undeclared as explained above.
 
 ### Model discovery
 
-The upstream model catalogue is tenant-specific, so the plugin asks the Agent
-Center for it per account instead of guessing. `model.for_auth` is answered from
-`GET /v1/agent-center/agents/detail?agent_id=...`, whose `gpts.models[]` carries
-`model_alias` (the ID the chat endpoint expects), `model_name`, and
-`model_parameters.{enabled,context_window,max_tokens,supports_images}`.
-Disabled entries are skipped, `model_alias` wins over `model_id`, and image
-support is only advertised in `agent` mode because the native endpoint has no
-image request contract.
+The upstream model catalogue is tenant-specific, so the plugin asks the upstream
+for it per account instead of guessing. Three catalogues are merged, in this
+order:
 
-- The two agent IDs the extension hard-codes (Act and Plan) are the defaults.
-  Override them with `model_agent_ids`, or set `discover_models: false` to
-  advertise only the configured `models`.
-- Discovery is cached for 5 minutes, keyed by `base_url` + account identity +
-  agent IDs, so accounts never see each other's catalogue and a `for_auth`
-  storm does not hammer the gateway.
-- Any failure — unreachable gateway, non-200, unparsable body, or a catalogue
-  with no enabled model — falls back to the configured `models` and logs a
-  warning. A partial failure (one agent unreachable) still uses whatever the
-  reachable agents returned.
+1. **Built-in models** — `GET {base_url}/v1/model/builtin` with
+   `Agent-Type: PromptCenter`, the endpoint the IDE's own model picker reads. Its
+   `builtinModels[]` carries `model_id`, `model_name` and `enable`.
+2. **限时福利 (free tier)** — `GET {benefit_base_url}/api/v1/gateway/config`,
+   whose `result.models[]` carries `model_id`, `context_window` and
+   `max_tokens`. These entries are tagged as benefit models, which is what makes
+   their chat requests carry the signed `maas_type: benefit` header (see
+   [Daily check-in](#daily-check-in--积分领取)).
+3. **Agent centre** — `GET {base_url}/v1/agent-center/agents/detail?agent_id=...`,
+   queried **only when both catalogues above come back empty**. Its
+   `gpts.models[]` carries `model_alias` (the ID the chat endpoint expects),
+   `model_name`, and `model_parameters.{enabled,context_window,max_tokens,supports_images}`.
+   Disabled entries are skipped, `model_alias` wins over `model_id`, and image
+   support is only advertised in `agent` mode because the native endpoint has no
+   image request contract.
+
+- The agent IDs used by the third source default to the Act and Plan agents the
+  extension hard-codes. Override them with `model_agent_ids`, set
+  `benefit_base_url: ""` to stop advertising benefit models, or set
+  `discover_models: false` to advertise only the configured `models`.
+- Discovery is cached for 5 minutes, keyed by `base_url` + `benefit_base_url` +
+  account identity + agent IDs, so accounts never see each other's catalogue and a
+  `for_auth` storm does not hammer the gateway.
+- Any failure — unreachable gateway, non-200, unparsable body, or a catalogue with
+  no enabled model — falls back to the configured `models` and logs a warning. A
+  partial failure (one catalogue unreachable) still uses whatever the reachable
+  ones returned.
 - Reverse mapping stays intact: a configured client-facing ID listed in
-  `model_map` is re-advertised alongside the discovered aliases when it maps
-  onto one of them, so existing client configurations keep working.
+  `model_map` is re-advertised alongside the discovered aliases when it maps onto
+  one of them, so existing client configurations keep working.
 
 ### Adaptation notes
 
@@ -576,7 +590,8 @@ example.
 
 | Key | Default | Description |
 | --- | --- | --- |
-| `base_url` | `https://snap-access.cn-north-4.myhuaweicloud.com` | Regional CodeArts Doer gateway. |
+| `base_url` | `https://snap-access.cn-north-4.myhuaweicloud.com` | Regional CodeArts Doer gateway. Only cn-north-4 and ap-southeast-1 exist; it must match the region that issued the login token. |
+| `benefit_base_url` | `https://opengw.developer.huaweicloud.com` | 限时福利 gateway: serves the free-tier catalogue, the daily claim and the balance. Empty string stops advertising benefit models. |
 | `api_mode` | `agent` | `agent` (`/api/v2/chat/completions`) or `native` (`/v1/chat/chat`). |
 | `web_login_base` | `https://codearts.huaweicloud.com` | Portal used to start OAuth browser sign-in. |
 | `oauth_token_url` | Huawei STS `/v1/oauth2/tokens` | OAuth authorization-code and refresh-token exchange endpoint. |
@@ -586,11 +601,11 @@ example.
 | `client_version` | `Vscode_<plugin_version>` | Sent as `client_version`. |
 | `language` | `en-us` | Sent as `X-Language`. |
 | `agent_id` | `Pangu_Doer_in_CodeArts` | Agent used by the native protocol. |
-| `default_model_id` | `PanguDev_COM_QC2` | Upstream model_id fallback. |
+| `default_model_id` | `GLM-5.2` | Upstream model_id fallback. |
 | `model_map` | `{}` | Client-facing ID → upstream model_id. |
-| `models` | one Pangu entry | Models advertised to CLIProxyAPI. |
-| `discover_models` | `true` | Ask the Agent Center for this account's model list on `model.for_auth`. |
-| `model_agent_ids` | Act/Plan agent UUIDs | Agent IDs queried for discovery; empty uses the extension's Act and Plan agents. |
+| `models` | one built-in entry | Models advertised when discovery is off, and the fallback when it fails. `benefit: true` marks a 限时福利 model so its chat requests carry the signed `maas_type: benefit` header. |
+| `discover_models` | `true` | Ask the upstream for this account's model list on `model.for_auth`; merges the built-in, benefit and (as a fallback) agent-centre catalogues. |
+| `model_agent_ids` | Act/Plan agent UUIDs | Agent IDs queried by the agent-centre fallback; empty uses the extension's Act and Plan agents. |
 | `heartbeat` | `true` | Request upstream SSE heartbeat frames. |
 | `sign_host` | `false` | Include `host` in `SignedHeaders`. |
 | `is_confidential` | `false` | Send the `is_confidential` header. |
@@ -610,6 +625,8 @@ example.
 | `schedule.tasks[].checkin_body` / `checkin_headers` | — | Body and extra headers for the claim request. |
 | `schedule.tasks[].checkin_success_marker` | — | Substring that must appear on a real claim. |
 | `schedule.tasks[].checkin_already_marker` | — | Substring meaning "already claimed"; counted as success. |
+| `schedule.tasks[].checkin_all_accounts` | `false` | Claim once per stored credential. The allowance is per Huawei Cloud account, so multi-account setups need this or only one account ever claims. Off by default because an unknown claim URL is not necessarily per-account. |
+| `schedule.tasks[].checkin_auth_index` | — | Restrict the claim to one credential, matched against auth index, file name or label. |
 
 ## Publishing to the CLIProxyAPI plugin store
 
@@ -786,11 +803,21 @@ Rebuild the library before running it: the test loads the file named by
 
 ## Known limitations
 
-- **Model discovery can be switched off.** The catalogue comes from the Agent
-  Center per account (see [Model discovery](#model-discovery)); if your tenant's
-  agents are not the extension's Act/Plan pair, set `model_agent_ids`, or disable
-  discovery and list the models yourself. A failed discovery never fails the
-  request — it falls back to the configured `models`.
+- **Model discovery can be switched off.** Three catalogues are merged per
+  account (see [Model discovery](#model-discovery)); the built-in and benefit ones
+  normally answer, and the agent-centre fallback only runs when both are empty. If
+  your tenant attaches models to different agents, set `model_agent_ids`, or
+  disable discovery and list the models yourself. A failed discovery never fails
+  the request — it falls back to the configured `models`.
+- **The 限时福利 channel throttles.** Under congestion it answers a well-formed
+  but empty completion, or HTTP 400 with no body at all. A reply that carried no
+  model output is retried in place, up to three attempts, and the frames of a
+  replaced attempt never reach the client — so a client either sees one real
+  completion or the last empty one, never two.
+- **Reasoning models need output budget.** Most catalogued models stream reasoning
+  text before content, so a small `max_tokens` can spend the whole budget on
+  reasoning and return an empty `content`. Ask for `stream: true` and a few
+  hundred tokens at least.
 - **`native` mode is text-only.** The proprietary `/v1/chat/chat` endpoint has no
   verified contract for tools or images, so `native` mode **rejects** requests
   that carry `tools`, `tool_choice`, `functions`, `function_call`, tool-role

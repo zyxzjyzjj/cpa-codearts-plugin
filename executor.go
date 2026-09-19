@@ -20,6 +20,19 @@ const agentModePath = "/api/v2/chat/completions"
 // nativeChatPath is the proprietary CodeArts chat endpoint.
 const nativeChatPath = "/v1/chat/chat"
 
+// The 限时福利 channel answers congestion by returning HTTP 200 with an empty
+// completion, or occasionally HTTP 400 with no body at all. Neither is a client
+// error: a fresh attempt normally returns content. Retries are capped so a
+// sustained outage cannot turn one request into a flood.
+const (
+	maxThrottleAttempts  = 3
+	throttleRetryBackoff = 350 * time.Millisecond
+	// preContentFrameLimit bounds how many frames are held back while waiting for
+	// the first content frame, so an unusual stream shape is never withheld
+	// indefinitely.
+	preContentFrameLimit = 32
+)
+
 // activeStreams tracks in-flight executor streams so shutdown can stop them.
 var activeStreams sync.Map
 
@@ -52,14 +65,40 @@ func executorExecute(request []byte) ([]byte, error) {
 		)
 	}
 
+	for attempt := 0; ; attempt++ {
+		payload, failure, retryable := executeOnce(cfg, req, cred)
+		if retryable && attempt+1 < maxThrottleAttempts {
+			logInfo("retrying a throttled upstream reply", map[string]any{
+				"model": req.Model, "attempt": attempt + 1,
+			})
+			time.Sleep(throttleRetryBackoff * time.Duration(attempt+1))
+			continue
+		}
+		if failure != nil {
+			return failure, nil
+		}
+		return okEnvelope(pluginapi.ExecutorResponse{
+			Payload: payload,
+			Headers: http.Header{"Content-Type": []string{"application/json"}},
+		})
+	}
+}
+
+// executeOnce performs one non-streaming upstream attempt. It returns the
+// aggregated payload, a ready-to-send failure envelope, or both nil plus whether
+// the reply had one of the throttle shapes that a fresh attempt can clear. The
+// Anthropic conversion happens here because the plugin owns that framing.
+func executeOnce(cfg *Config, req executorRequest, cred *credential) ([]byte, []byte, bool) {
 	upstreamBody, endpoint, headers, errBuild := buildUpstreamRequest(cfg, req, cred, true)
 	if errBuild != nil {
-		return failEnvelope("invalid_request", errBuild.Error(), http.StatusBadRequest)
+		failure, _ := failEnvelope("invalid_request", errBuild.Error(), http.StatusBadRequest)
+		return nil, failure, false
 	}
 
 	response, errDo := readUpstreamResponse(cfg, req.HostCallbackID, endpoint, headers, upstreamBody)
 	if errDo != nil {
-		return failEnvelope("upstream_unreachable", "upstream request failed: "+errDo.Error(), http.StatusBadGateway)
+		failure, _ := failEnvelope("upstream_unreachable", "upstream request failed: "+errDo.Error(), http.StatusBadGateway)
+		return nil, failure, false
 	}
 	if response.StatusCode != http.StatusOK {
 		status := httpStatusFor(response.StatusCode)
@@ -71,27 +110,29 @@ func executorExecute(request []byte) ([]byte, error) {
 		} else if response.StatusCode == http.StatusTooManyRequests {
 			code = "rate_limit_exceeded"
 		}
-		return failEnvelope(code, fmt.Sprintf("upstream returned HTTP %d: %s", response.StatusCode, truncate(string(response.Body), 500)), status)
+		failure, _ := failEnvelope(code, fmt.Sprintf("upstream returned HTTP %d: %s", response.StatusCode, truncate(string(response.Body), 500)), status)
+		return nil, failure, isThrottledStatus(response.StatusCode, response.Body)
 	}
 
 	payload, errAggregate := aggregateUpstream(cfg, req.Model, response.Body)
 	if errAggregate != nil {
-		return failEnvelope("upstream_error", errAggregate.Error(), http.StatusBadGateway)
+		failure, _ := failEnvelope("upstream_error", errAggregate.Error(), http.StatusBadGateway)
+		return nil, failure, false
 	}
-	// The host forwards the payload unchanged for Anthropic clients because the
-	// plugin declares "claude" as an output format, so the plugin owns the
-	// conversion there.
+	if !aggregatedHasContent(payload) {
+		// Still return the payload: once the retry budget is spent the client gets
+		// the well-formed (if empty) completion rather than a synthetic error.
+		return payload, nil, true
+	}
 	if clientProtocol(req.Format) == protocolClaude {
 		anthropic, errConvert := anthropicMessageFromCompletion(payload)
 		if errConvert != nil {
-			return failEnvelope("upstream_error", errConvert.Error(), http.StatusBadGateway)
+			failure, _ := failEnvelope("upstream_error", errConvert.Error(), http.StatusBadGateway)
+			return nil, failure, false
 		}
 		payload = anthropic
 	}
-	return okEnvelope(pluginapi.ExecutorResponse{
-		Payload: payload,
-		Headers: http.Header{"Content-Type": []string{"application/json"}},
-	})
+	return payload, nil, false
 }
 
 // executorExecuteStream handles the streaming path. When the host supplies a
@@ -131,17 +172,22 @@ func executorExecuteStream(request []byte) ([]byte, error) {
 
 	// Open before accepting the stream so CPA can observe 401/403/429 and
 	// perform its normal account cooldown/retry logic with the real status.
-	open, errOpen := hostHTTPDoStream(req.HostCallbackID, http.MethodPost, endpoint, headers, upstreamBody)
+	active, errOpen := hostHTTPDoStream(req.HostCallbackID, http.MethodPost, endpoint, headers, upstreamBody)
 	if errOpen != nil {
 		return failEnvelope("upstream_unreachable", errOpen.Error(), http.StatusBadGateway)
 	}
-	if open.StatusCode != http.StatusOK {
-		_ = hostHTTPStreamClose(open.StreamID)
-		return failEnvelope("upstream_error", fmt.Sprintf("upstream returned HTTP %d", open.StatusCode), httpStatusFor(open.StatusCode))
+	if active.StatusCode != http.StatusOK {
+		_ = hostHTTPStreamClose(active.StreamID)
+		return failEnvelope("upstream_error", fmt.Sprintf("upstream returned HTTP %d", active.StatusCode), httpStatusFor(active.StatusCode))
 	}
-	stop, errRegister := registerActiveStream(req.StreamID, func() { _ = hostHTTPStreamClose(open.StreamID) })
+	holder := &liveStream{current: active}
+	stop, errRegister := registerActiveStream(req.StreamID, func() {
+		if id := holder.id(); id != "" {
+			_ = hostHTTPStreamClose(id)
+		}
+	})
 	if errRegister != nil {
-		_ = hostHTTPStreamClose(open.StreamID)
+		_ = hostHTTPStreamClose(active.StreamID)
 		return nil, errRegister
 	}
 	session := &executorStreamSession{streamID: req.StreamID, stop: stop}
@@ -149,7 +195,7 @@ func executorExecuteStream(request []byte) ([]byte, error) {
 		defer session.stop()
 		timer := time.AfterFunc(cfg.requestTimeout(), func() { session.fail("upstream request timed out") })
 		defer timer.Stop()
-		runUpstreamStream(cfg, req, open, session)
+		runUpstreamStreamRetry(cfg, req, cred, holder, session)
 	}()
 
 	// An empty chunk list tells the host to consume the async stream bridge.
@@ -185,26 +231,125 @@ func (s *executorStreamSession) success() {
 	})
 }
 
-// runUpstreamStream drives one upstream streaming request and forwards
-// translated frames to the host. Every exit path goes through the session, so
-// the upstream stream is closed exactly once.
-func runUpstreamStream(cfg *Config, req executorRequest, open *hostHTTPStreamOpen, session *executorStreamSession) {
+// liveStream tracks the upstream stream the session currently owns. The
+// registered shutdown hook reads it, so a replaced attempt cannot leave the
+// stream that is still in flight unclosed.
+type liveStream struct {
+	mu      sync.Mutex
+	current *hostHTTPStreamOpen
+}
+
+func (l *liveStream) id() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.current == nil {
+		return ""
+	}
+	return l.current.StreamID
+}
+
+func (l *liveStream) set(open *hostHTTPStreamOpen) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.current = open
+}
+
+func (l *liveStream) get() *hostHTTPStreamOpen {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.current
+}
+
+// runUpstreamStreamRetry consumes upstream attempts until one yields model
+// output, the stream ends in a terminal state, or the throttle budget is spent.
+// A throttled attempt is replaced rather than surfaced, because it carries no
+// answer at all.
+func runUpstreamStreamRetry(cfg *Config, req executorRequest, cred *credential, holder *liveStream, session *executorStreamSession) {
+	for attempt := 1; ; attempt++ {
+		// Only this goroutine replaces the stream, so reading it here cannot race
+		// with a concurrent update; the shutdown hook takes the lock instead.
+		open := holder.get()
+		final := attempt >= maxThrottleAttempts
+		if _, terminal := runUpstreamStream(cfg, req, open, session, final); terminal {
+			return
+		}
+		logInfo("retrying an empty upstream stream", map[string]any{"model": req.Model, "attempt": attempt})
+		_ = hostHTTPStreamClose(open.StreamID)
+		time.Sleep(throttleRetryBackoff * time.Duration(attempt))
+
+		upstreamBody, endpoint, headers, errBuild := buildUpstreamRequest(cfg, req, cred, true)
+		if errBuild != nil {
+			session.fail(errBuild.Error())
+			return
+		}
+		reopened, errOpen := hostHTTPDoStream(req.HostCallbackID, http.MethodPost, endpoint, headers, upstreamBody)
+		if errOpen != nil {
+			session.fail("upstream retry failed: " + errOpen.Error())
+			return
+		}
+		if reopened.StatusCode != http.StatusOK {
+			_ = hostHTTPStreamClose(reopened.StreamID)
+			session.fail(fmt.Sprintf("upstream returned HTTP %d", reopened.StatusCode))
+			return
+		}
+		holder.set(reopened)
+	}
+}
+
+// runUpstreamStream drives one upstream streaming request and forwards translated
+// frames to the host. Every exit path goes through the session, so the upstream
+// stream is closed exactly once.
+//
+// Frames are held back until the first one that actually carries model output.
+// That is what makes a retry possible: the 限时福利 channel answers congestion
+// with a well-formed but empty completion, and once those frames had reached the
+// client a second completion could no longer be appended to the same response.
+// `final` marks the last attempt, whose held frames are replayed so the client
+// still receives a protocol-complete reply when nothing ever produced output.
+func runUpstreamStream(cfg *Config, req executorRequest, open *hostHTTPStreamOpen, session *executorStreamSession, final bool) (bool, bool) {
 	translator := newStreamRenderer(cfg, req.Model, clientProtocol(req.Format))
+	var held [][]byte
+	sawContent := false
+
+	emit := func(frame []byte) bool {
+		if errEmit := hostStreamEmit(session.streamID, frame); errEmit != nil {
+			// The client went away; stop reading upstream without reporting a
+			// second error for a request the host already abandoned.
+			session.success()
+			return false
+		}
+		return true
+	}
+	flushHeld := func() bool {
+		for _, frame := range held {
+			if !emit(frame) {
+				return false
+			}
+		}
+		held = nil
+		return true
+	}
 
 	for {
 		payload, done, errRead := hostHTTPStreamRead(open.StreamID)
 		if errRead != nil {
 			session.fail("upstream stream read failed: " + errRead.Error())
-			return
+			return sawContent, true
 		}
-		if len(payload) > 0 {
-			for _, frame := range translator.feed(payload) {
-				if errEmit := hostStreamEmit(session.streamID, translator.hostPayload(frame)); errEmit != nil {
-					// The client went away; stop reading upstream without reporting
-					// a second error for a request the host already abandoned.
-					session.success()
-					return
+		for _, frame := range translator.feed(payload) {
+			hostFrame := translator.hostPayload(frame)
+			if !sawContent {
+				if !frameHasContent(frame) && len(held) < preContentFrameLimit {
+					held = append(held, hostFrame)
+					continue
 				}
+				sawContent = true
+				if !flushHeld() {
+					return true, true
+				}
+			}
+			if !emit(hostFrame) {
+				return true, true
 			}
 		}
 		if done {
@@ -212,13 +357,21 @@ func runUpstreamStream(cfg *Config, req executorRequest, open *hostHTTPStreamOpe
 		}
 	}
 
-	for _, frame := range translator.finish() {
-		if errEmit := hostStreamEmit(session.streamID, translator.hostPayload(frame)); errEmit != nil {
-			session.success()
-			return
+	tail := translator.finish()
+	if !sawContent && !final {
+		// Nothing reached the client, so the caller can replace this attempt.
+		return false, false
+	}
+	if !sawContent && !flushHeld() {
+		return false, true
+	}
+	for _, frame := range tail {
+		if !emit(translator.hostPayload(frame)) {
+			return sawContent, true
 		}
 	}
 	session.success()
+	return sawContent, true
 }
 
 // bufferedStreamResponse renders the whole upstream response as one SSE reply
@@ -305,6 +458,12 @@ func buildUpstreamRequest(cfg *Config, req executorRequest, cred *credential, st
 	}
 
 	headers := baseUpstreamHeaders(cfg, req)
+	// 限时福利 models live on a separate MaaS channel: the agent endpoint answers
+	// "The model is not registered" unless maas_type travels with the request, and
+	// it must be present before signing so it lands in SignedHeaders.
+	if cfg.APIMode != "native" && cfg.isBenefitModel(cfg.upstreamModel(req.Model)) {
+		headers["maas_type"] = "benefit"
+	}
 	if !cred.valid() {
 		// Debugging escape hatch: send the request unsigned.
 		logWarn("sending an unsigned upstream request because no credential is available", map[string]any{"endpoint": endpoint})
@@ -690,9 +849,6 @@ func readUpstreamResponse(cfg *Config, callbackID, endpoint string, headers map[
 	}
 	defer hostHTTPStreamClose(open.StreamID)
 	resp := &hostHTTPResponse{StatusCode: open.StatusCode, Headers: open.Headers}
-	if open.StatusCode != http.StatusOK {
-		return resp, nil
-	}
 	ctx, cancel := context.WithTimeout(context.Background(), cfg.requestTimeout())
 	defer cancel()
 	stop := context.AfterFunc(ctx, func() { _ = hostHTTPStreamClose(open.StreamID) })

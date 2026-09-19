@@ -359,18 +359,29 @@ func TestAccountModelDiscoveryIsolation(t *testing.T) {
 		requests++
 		req := request.(map[string]any)
 		u, _ := url.Parse(req["url"].(string))
-		if u.Path != "/v1/agent-center/agents/detail" || u.Query().Get("agent_id") != "agent" {
-			t.Fatal("wrong discovery contract")
-		}
 		if req["host_callback_id"] != "callback" {
 			t.Fatal("callback context lost")
 		}
 		headers := req["headers"].(map[string][]string)
-		model := "tenant-a"
+		tenant := "tenant-a"
 		if strings.Contains(headers["Authorization"][0], "Access=account-b") {
-			model = "tenant-b"
+			tenant = "tenant-b"
 		}
-		return json.Marshal(hostHTTPResponse{StatusCode: http.StatusOK, Body: []byte(`{"gpts":{"models":[{"model_alias":"` + model + `","model_id":"internal-id","model_name":"Test","model_parameters":{"enabled":true,"supports_images":true,"context_window":200000,"max_tokens":16000}},{"model_alias":"disabled","model_parameters":{"enabled":false}}]}}`)})
+		switch u.Path {
+		case "/v1/model/builtin":
+			if headers["Agent-Type"][0] != "PromptCenter" {
+				t.Fatal("the built-in catalogue must be asked with Agent-Type: PromptCenter")
+			}
+			return json.Marshal(hostHTTPResponse{StatusCode: http.StatusOK, Body: []byte(`{"builtinModels":[` +
+				`{"model_id":"` + tenant + `","model_name":"Test","enable":true,"supports_images":true,"context_window":200000,"max_tokens":16000},` +
+				`{"model_id":"disabled","enable":false}]}`)})
+		case "/api/v1/gateway/config":
+			return json.Marshal(hostHTTPResponse{StatusCode: http.StatusOK, Body: []byte(`{"error_code":"0000","result":{"models":[` +
+				`{"model_id":"` + tenant + `-free","model_name":"Free","context_window":1048576,"max_tokens":393216}]}}`)})
+		default:
+			t.Fatalf("unexpected discovery path %s", u.Path)
+			return nil, nil
+		}
 	})
 	a := &credential{AccessKeyID: "account-a", SecretAccessKey: "test"}
 	b := &credential{AccessKeyID: "account-b", SecretAccessKey: "test"}
@@ -382,13 +393,83 @@ func TestAccountModelDiscoveryIsolation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = discoverAccountModels(cfg, a, "callback")
+	third, err := discoverAccountModels(cfg, a, "callback")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if requests != 2 || len(first) != 1 || first[0].ID != "tenant-a" || second[0].ID != "tenant-b" || !first[0].SupportsImages {
-		t.Fatal("discovery did not isolate accounts, cache, or preserve model aliases")
+	// requests stays at four: two accounts x (built-in + benefit), with the third
+	// call answered from cache, and each account only ever sees its own catalogue.
+	if requests != 4 || len(first) != 2 || len(second) != 2 || len(third) != 2 {
+		t.Fatalf("discovery did not isolate accounts or cache results: requests=%d first=%v second=%v third=%v",
+			requests, idsOfModels(first), idsOfModels(second), idsOfModels(third))
 	}
+	if first[0].ID != "tenant-a" || !first[0].SupportsImages || second[0].ID != "tenant-b" {
+		t.Fatal("built-in catalogue entries lost their fields or crossed accounts")
+	}
+	for _, pair := range []struct {
+		models  []ModelConfig
+		benefit string
+	}{{first, "tenant-a-free"}, {second, "tenant-b-free"}} {
+		if pair.models[1].ID != pair.benefit || !pair.models[1].Benefit {
+			t.Fatalf("the 限时福利 entry was not tagged: %+v", pair.models[1])
+		}
+	}
+	if !cfg.isBenefitModel("tenant-a-free") {
+		t.Fatal("discovered benefit models must be routable without config entries")
+	}
+	if cfg.isBenefitModel("tenant-a") {
+		t.Fatal("built-in catalogue models must not carry the benefit header")
+	}
+}
+
+func TestAgentCenterDiscoveryIsTheFallback(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.ModelAgentIDs = []string{"agent"}
+	cfg.BaseURL = "https://discovery.test"
+	var paths []string
+	testHost(t, func(method string, request any) (json.RawMessage, error) {
+		req := request.(map[string]any)
+		u, _ := url.Parse(req["url"].(string))
+		paths = append(paths, u.Path)
+		switch u.Path {
+		case "/v1/model/builtin", "/api/v1/gateway/config":
+			return json.Marshal(hostHTTPResponse{StatusCode: http.StatusOK, Body: []byte(`{"builtinModels":[],"result":{"models":[]}}`)})
+		case "/v1/agent-center/agents/detail":
+			if u.Query().Get("agent_id") != "agent" {
+				t.Fatal("wrong agent id queried")
+			}
+			headers := req["headers"].(map[string][]string)
+			if headers["Agent-Type"][0] != "AgentCenter" {
+				t.Fatal("agent centre must be asked with Agent-Type: AgentCenter")
+			}
+			return json.Marshal(hostHTTPResponse{StatusCode: http.StatusOK, Body: []byte(`{"gpts":{"models":[` +
+				`{"model_alias":"tenant-a","model_id":"internal-id","model_name":"Test","model_parameters":{"enabled":true,"supports_images":true,"context_window":200000,"max_tokens":16000}},` +
+				`{"model_alias":"disabled","model_parameters":{"enabled":false}}]}}`)})
+		default:
+			t.Fatalf("unexpected discovery path %s", u.Path)
+			return nil, nil
+		}
+	})
+	models, err := discoverAccountModels(cfg, &credential{AccessKeyID: "account-fallback", SecretAccessKey: "test"}, "callback")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(models) != 1 || models[0].ID != "tenant-a" || !models[0].SupportsImages {
+		t.Fatalf("agent-centre fallback lost its aliases: %+v", models)
+	}
+	for _, want := range []string{"/v1/model/builtin", "/api/v1/gateway/config", "/v1/agent-center/agents/detail"} {
+		if !strings.Contains(strings.Join(paths, ","), want) {
+			t.Fatalf("discovery never queried %s: %v", want, paths)
+		}
+	}
+}
+
+func idsOfModels(models []ModelConfig) []string {
+	out := make([]string, 0, len(models))
+	for _, model := range models {
+		out = append(out, model.ID)
+	}
+	return out
 }
 
 func TestNativeAggregateRetainsFinalUsage(t *testing.T) {
