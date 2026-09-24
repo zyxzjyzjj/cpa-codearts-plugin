@@ -843,7 +843,17 @@ Asset names use the version **without** the leading `v`:
 ```text
 codearts-provider_0.1.1_windows_amd64.zip
 codearts-provider_0.1.1_linux_amd64.zip
+codearts-provider_0.1.1_darwin_arm64.zip
+codearts-provider_0.1.1_darwin_amd64.zip
 checksums.txt
+```
+
+The two macOS archives need a Mac, because cgo for Darwin wants the Apple SDK:
+
+```bash
+# on macOS: arm64 is native, amd64 is a same-SDK cross build
+PLATFORMS="darwin/arm64 darwin/amd64" \
+CC_darwin_amd64="clang -arch x86_64" bash tools/package-release.sh 0.1.1
 ```
 
 Each zip must contain the dynamic library **at the archive root**, named
@@ -933,7 +943,7 @@ naming rules the store enforces and a CI recipe for the other platforms — see
 ## Building and testing
 
 Pushing a version tag such as `v0.1.1` runs
-[the release workflow](.github/workflows/release.yml): tests, Linux/Windows
+[the release workflow](.github/workflows/release.yml): tests, Linux/Windows/macOS
 builds, ABI/archive verification, checksums and GitHub Release publication.
 On Windows, run [`release.bat`](release.bat) to validate, commit, push and create
 the tag in one guided step. Passing a new version also updates `main.go` and both

@@ -141,3 +141,93 @@ jobs:
               --title "$RELEASE_TAG" \
               "${notes[@]}"
           fi
+
+  # macOS assets cannot be cross-built from the Linux job above: cgo for Darwin
+  # needs the Apple SDK (osxcross at best), so this runs on a macOS runner and
+  # amends the release the first job published. Keeping it separate means a
+  # macOS runner outage still leaves a working Linux/Windows release.
+  darwin:
+    name: Build macOS assets
+    needs: release
+    runs-on: macos-latest
+    env:
+      RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+    steps:
+      - name: Check out the release tag
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build darwin archives
+        env:
+          # The runner is arm64, so darwin/arm64 is native and darwin/amd64 is a
+          # same-SDK cross build; -arch is the only extra flag cgo needs.
+          PLATFORMS: "darwin/arm64 darwin/amd64"
+          CC_darwin_arm64: clang
+          CC_darwin_amd64: clang -arch x86_64
+        shell: bash
+        run: bash tools/package-release.sh "${RELEASE_TAG#v}"
+
+      - name: Verify archives and ABI
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${RELEASE_TAG#v}"
+          cd release-assets
+          for pair in "arm64 darwin_arm64" "x86_64 darwin_amd64"; do
+            arch="${pair%% *}"
+            suffix="${pair##* }"
+            zip="codearts-provider_${version}_${suffix}.zip"
+            # The store rejects nested libraries and extra entries.
+            test "$(unzip -Z1 "$zip" | wc -l | tr -d ' ')" -eq 1
+            test "$(unzip -Z1 "$zip")" = "codearts-provider.dylib"
+            lib="/tmp/codearts-provider-${arch}.dylib"
+            unzip -p "$zip" codearts-provider.dylib > "$lib"
+            # Drain the pipe instead of using grep -q: this job runs under
+            # `set -o pipefail`, and an early-exiting reader makes the writer
+            # die of SIGPIPE, which then fails the step even though it matched.
+            file "$lib" | grep -E "Mach-O 64-bit dynamically linked shared library ${arch}$" > /dev/null
+            for symbol in _cliproxy_plugin_init _cliproxyPluginCall _cliproxyPluginFree _cliproxyPluginShutdown; do
+              nm -gU "$lib" | grep -E "[[:space:]]${symbol}$" > /dev/null
+            done
+          done
+          # arm64 macOS refuses to dlopen an unsigned image; the external linker
+          # adhoc-signs it and that signature is what makes the install work.
+          codesign -dv /tmp/codearts-provider-arm64.dylib 2>&1 | grep -F adhoc > /dev/null
+
+      - name: Merge checksums and attach to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${RELEASE_TAG#v}"
+          gh release download "$RELEASE_TAG" --pattern checksums.txt --clobber
+          # Ours first, then the published rows: `!seen[$2]++` keeps the first
+          # row per file name, so the hashes for the archives this job just built
+          # always win. Reading the published file first would keep a stale
+          # darwin row when only this job is re-run, and the release would then
+          # ship fresh zips whose checksums no longer match.
+          { cat release-assets/checksums.txt; cat checksums.txt; } | awk '!seen[$2]++' | sort -k2 > checksums.merged.txt
+          for asset in \
+            "codearts-provider_${version}_linux_amd64.zip" \
+            "codearts-provider_${version}_windows_amd64.zip" \
+            "codearts-provider_${version}_darwin_arm64.zip" \
+            "codearts-provider_${version}_darwin_amd64.zip"; do
+            grep -Fq "  ${asset}" checksums.merged.txt || { echo "checksums missing $asset" >&2; exit 1; }
+          done
+          mv checksums.merged.txt checksums.txt
+          grep -F darwin checksums.txt > /tmp/darwin-sums.txt
+          ( cd release-assets && shasum -a 256 -c /tmp/darwin-sums.txt )
+          gh release upload "$RELEASE_TAG" \
+            "release-assets/codearts-provider_${version}_darwin_arm64.zip" \
+            "release-assets/codearts-provider_${version}_darwin_amd64.zip" \
+            checksums.txt \
+            --clobber

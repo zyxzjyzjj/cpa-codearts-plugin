@@ -227,7 +227,9 @@ The repository includes
 tag such as `v0.1.1` runs tests, builds Linux/glibc amd64 and Windows amd64,
 checks both ABIs and archives, runs the Linux library in the official CPA v7.3.9
 host against local fixtures (including optional-request cancellation), then creates the GitHub Release with the two zips
-and `checksums.txt`. The workflow can also be rerun manually with an existing
+and `checksums.txt`. A second job then builds the two macOS archives on a macOS
+runner and amends that release, merging its hashes into the published
+`checksums.txt`. The workflow can also be rerun manually with an existing
 tag; existing assets are replaced with the rebuilt copies.
 
 Release notes come from `docs/releases/<tag>.md` when present; otherwise GitHub
@@ -239,7 +241,19 @@ organization policy blocks write-capable workflow tokens, allow this repository
 to create releases under Settings → Actions → General.
 
 macOS targets (`darwin/amd64`, `darwin/arm64`) require a macOS runner because
-cross-compiling cgo for Darwin from Linux needs osxcross and the Apple SDK.
+cross-compiling cgo for Darwin from Linux needs osxcross and the Apple SDK, so
+the workflow's `darwin` job runs on `macos-latest` after the release exists and
+uploads its two archives with `gh release upload --clobber`. It builds arm64
+natively and amd64 with `CC="clang -arch x86_64"` (one SDK, both slices), then
+checks each archive holds exactly one root-level `codearts-provider.dylib`, that
+the Mach-O slice matches its file name, that all four ABI exports are present,
+and that the arm64 library carries the adhoc signature the linker adds — Apple
+Silicon refuses to `dlopen` an unsigned image, so an arm64 asset built without a
+signature would install and then fail to load.
+
+Keeping macOS in its own job means a runner outage or a signing change cannot
+take the Linux/Windows release down with it: the first job has already published,
+and a re-run of the workflow replaces everything.
 
 ## Troubleshooting
 
